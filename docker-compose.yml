@@ -1,0 +1,53 @@
+version: '3.11'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pokemon_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pokemon_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pokemon_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pokemon_network
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pokeapi-fastapi
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/pokemon_db
+      POKEAPI_BASE_URL: https://pokeapi.co/api/v2
+      ITEMS_PER_PAGE: 20
+    volumes:
+      - ./app:/app
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "sleep 3 &&
+                 python scripts/create_tables.py &&
+                 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    networks:
+      - pokemon_network
+
+networks:
+  pokemon_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
