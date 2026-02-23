@@ -118,6 +118,15 @@ class AsyncPokeAPIService:
             if pokemon_id:
                 location_data = await self.fetch_location_data(pokemon_id)
             evolutions = self.extract_evolutions(evolution_data)
+            sprites = pokemon_data.get('sprites', {})
+            processed_sprites = {
+                'front_default': sprites.get('front_default'),
+                'front_shiny': sprites.get('front_shiny'),
+                'back_default': sprites.get('back_default'),
+                'back_shiny': sprites.get('back_shiny'),
+                'official_artwork': sprites.get('other', {}).get('official-artwork', {}).get('front_default'),
+                'generations': sprites.get('versions', {})
+            }
             return {
                 'id': pokemon_data.get('id'),
                 'name': pokemon_data.get('name'),
@@ -133,7 +142,8 @@ class AsyncPokeAPIService:
                 'abilities': self.extract_abilities(pokemon_data),
                 'types': self.extract_types(pokemon_data),
                 'evolutions': evolutions,
-                'locations': [loc['location_area']['name'] for loc in location_data]
+                'locations': [loc['location_area']['name'] for loc in location_data],
+                'sprites': processed_sprites
             }
         except Exception as e:
             logger.error(f"Error procesando datos del Pokémon {pokemon_data.get('name')}: {e}")
@@ -147,17 +157,18 @@ class AsyncPokeAPIService:
             if not chain:
                 return
             species = chain.get('species', {})
-            evolution_details = chain.get('evolution_details', [])
+            url = species.get('url', '')
+            pokemon_id = url.split('/')[-2] if url else None
+            evolution_details = chain.get('evolution_details', [{}])[0]
             evolutions.append({
                 'name': species.get('name', ''),
-                'url': species.get('url', ''),
-                'min_level': evolution_details[0].get('min_level') if evolution_details else None,
-                'trigger': evolution_details[0].get('trigger', {}).get('name') if evolution_details else None
+                'id': int(pokemon_id) if pokemon_id and pokemon_id.isdigit() else None,
+                'min_level': evolution_details.get('min_level'),
+                'trigger': evolution_details.get('trigger', {}).get('name') if evolution_details else None
             })
             for next_chain in chain.get('evolves_to', []):
                 traverse_chain(next_chain)
-        if evolution_data:
-            traverse_chain(evolution_data.get('chain', {}))
+        traverse_chain(evolution_data.get('chain', {}))
         return evolutions
 
 
@@ -264,7 +275,8 @@ class BulkPokemonLoader:
                 'speed': pokemon_data['base_stats']['speed'],
                 'total_stats': pokemon_data['base_stats']['total_stats'],
                 'evolutions': json.dumps(pokemon_data['evolutions']),
-                'locations': json.dumps(pokemon_data['locations'])
+                'locations': json.dumps(pokemon_data['locations']),
+                'sprites': json.dumps(pokemon_data['sprites'])
             }
             if existing_pokemon and force_update:
                 for key, value in pokemon_dict.items():
@@ -309,3 +321,50 @@ class BulkPokemonLoader:
         pokemon.abilities.clear()
         pokemon.types.clear()
         self._add_relationships(pokemon, pokemon_data)
+
+
+async def run_daily_pokemon_update():
+    from app.database import SessionLocal
+    from app import services, crud
+    import uuid
+    from datetime import datetime
+    import aiohttp
+    import asyncio
+
+    db = SessionLocal()
+    try:
+        service = services.AsyncPokeAPIService()
+        async with aiohttp.ClientSession() as session:
+            url = f'{service.BASE_URL}/pokemon?limit=1'
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.error('No se pudo obtener el total de Pokémon para la tarea diaria')
+                    return
+                data = await resp.json()
+                total = data.get('count', 0)
+        if total == 0:
+            logger.error('El total de Pokémon es 0, no se ejecuta la carga')
+            return
+
+        task_id = f'daily_{uuid.uuid4().hex[:8]}_{int(datetime.now().timestamp())}'
+        task_data = {
+            'limit': total, 'offset': 0, 'batch_size': 100, 'force_update': True
+        }
+        crud.create_task(db, task_id, 'daily_pokemon_load', task_data)
+        async def run():
+            try:
+                loader = services.BulkPokemonLoader(db)
+                result = await loader.load_pokemons(limit=total, offset=0, force_update=True)
+                crud.complete_task(db, task_id, {
+                    'total_requested': total,
+                    'loaded': result.get('loaded', 0),
+                    'errors': result.get('errors', 0),
+                    'completed_at': datetime.utcnow().isoformat()
+                })
+                logger.info(f"✅ Actualización diaria completada: {result.get('loaded')} cargados")
+            except Exception as e:
+                crud.fail_task(db, task_id, str(e))
+                logger.error(f'❌ Error en actualización diaria: {e}')
+        asyncio.create_task(run())
+    finally:
+        db.close()

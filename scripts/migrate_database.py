@@ -2,8 +2,8 @@ import sys
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import text, inspect
-from app.database import engine, Base
-from app.models import Pokemon, Ability, Type, Stat
+from app.database import engine
+from app.models import Pokemon
 import logging
 
 
@@ -30,7 +30,8 @@ def add_new_columns():
         ('growth_rate', 'VARCHAR(255)'),
         ('species', 'VARCHAR(255)'),
         ('evolutions', 'JSONB'),
-        ('locations', 'JSONB')
+        ('locations', 'JSONB'),
+        ('sprites', 'JSONB')
     ]
     with engine.begin() as conn:
         for column_name, column_type in new_columns:

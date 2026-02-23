@@ -21,7 +21,7 @@ pokemon_types = Table(
 
 
 class Pokemon(Base):
-    __tablename__ = "pokemons"
+    __tablename__ = 'pokemons'
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True, nullable=False)
     height = Column(Float)
@@ -44,6 +44,7 @@ class Pokemon(Base):
     abilities = relationship('Ability', secondary=pokemon_abilities, back_populates='pokemons')
     types = relationship('Type', secondary=pokemon_types, back_populates='pokemons')
     stats = relationship('Stat', back_populates='pokemon', cascade='all, delete-orphan')
+    sprites = Column(JSONB, nullable=True, default=dict)
 
 
 class Ability(Base):

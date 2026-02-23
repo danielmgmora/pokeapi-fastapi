@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 from enum import Enum
-from pydantic import BaseModel, ConfigDict, Field, field_validator, computed_field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, computed_field, model_validator
 from typing import List, Optional, Any, Dict
 
 
@@ -30,6 +30,9 @@ class BaseResponse(BaseModel):
     message: Optional[str] = None
     timestamp: datetime = Field(default_factory=datetime.now)
     model_config = ConfigDict(from_attributes=True)
+
+    def dict_json(self):
+        return self.model_dump(mode='json')
 
 
 class AbilityBase(BaseModel):
@@ -100,16 +103,21 @@ class PokemonBase(BaseModel):
     species: Optional[str] = Field(None, max_length=100)
     evolutions: Optional[List[Dict[str, Any]]] = []
     locations: Optional[List[str]] = []
+    sprites: Optional[Dict[str, Any]] = None
 
-    @field_validator('evolutions', 'locations', mode='before')
+    @field_validator('sprites', 'evolutions', 'locations', mode='before')
     @classmethod
     def parse_json(cls, v):
+        if v is None:
+            if cls.__fields__['sprites'].annotation == Optional[Dict[str, Any]]:
+                return {}
+            return []
         if isinstance(v, str):
             try:
                 return json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return []
-        return v or []
+            except:
+                return {} if 'sprites' in cls.__fields__ else []
+        return v
 
     @field_validator('name', mode='before')
     @classmethod
@@ -158,6 +166,17 @@ class PokemonDetailed(Pokemon):
             total=self.total_stats or 0
         )
     model_config = ConfigDict(from_attributes=True)
+
+
+class PokemonSearchParams(BaseModel):
+    id: Optional[int] = Field(None, ge=1, description='ID del Pokémon (debe ser > 0)')
+    name: Optional[str] = Field(None, min_length=1, max_length=50, description='Nombre del Pokémon')
+
+    @model_validator(mode='after')
+    def check_at_least_one(cls, values):
+        if values.id is None and values.name is None:
+            raise ValueError('Debe proporcionar al menos uno de los campos: id o name')
+        return values
 
 
 class PaginatedResponse(BaseResponse):

@@ -1,6 +1,8 @@
+import logging
 import sys
 from pathlib import Path
-import logging
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
@@ -8,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy import inspect
+from .services import run_daily_pokemon_update
 
 
 current_dir = Path(__file__).parent
@@ -37,6 +40,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+scheduler = None
 
 
 @asynccontextmanager
@@ -51,7 +55,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f'❌ Error creando tablas: {e}')
         logger.warning('⚠️  Continuando sin tablas (modo de solo lectura posible)')
+    global scheduler
+    scheduler = AsyncIOScheduler()
+    scheduler.start()
+    scheduler.add_job(
+        func=run_daily_pokemon_update,
+        trigger=CronTrigger(hour=0, minute=0),
+        id='daily_pokemon_update',
+        replace_existing=True
+    )
+    logger.info('⏰ Tarea diaria de actualización programada a las 00:00')
     yield
+    if scheduler:
+        scheduler.shutdown()
     logger.info('🛑 Deteniendo Pokémon API...')
 
 
@@ -101,7 +117,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             message='Error de validación en los datos enviados',
             error_type='ValidationError',
             error_details={'validation_errors': errors}
-        ).model_dump()
+        ).model_dump(mode='json')
     )
 
 
@@ -113,7 +129,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             success=False,
             message=exc.detail,
             error_type='HTTPException'
-        ).model_dump()
+        ).model_dump(mode='json')
     )
 
 
@@ -127,7 +143,7 @@ async def global_exception_handler(request: Request, exc: Exception):
             message='Error interno del servidor',
             error_type='InternalServerError',
             error_details={'exception': str(exc)[:100]}
-        ).model_dump()
+        ).model_dump(mode='json')
     )
 
 

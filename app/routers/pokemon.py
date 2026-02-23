@@ -1,7 +1,9 @@
+import json
 import logging
 from math import ceil
 from fastapi import APIRouter, Depends, HTTPException, Query, Path, status
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.exc import SQLAlchemyError
 from typing import Optional, List
 from .. import crud, models, schemas
 from ..database import get_db
@@ -127,11 +129,18 @@ def read_pokemons(
             total=total, page=page, items_per_page=items_per_page, total_pages=total_pages, data=pokemons, message=message
         )
     except ValueError as e:
+        db.rollback()
         logger.warning(f'Validación fallida al obtener Pokemones: {e}')
         raise HTTPException(status_code=400, detail=str(e))
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f'Error de base de datos: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail="Error interno al consultar la base de datos")
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
+        db.rollback()
         logger.error(f'Error inesperado al obtener Pokemones: {e}', exc_info=True)
         raise HTTPException(status_code=500, detail='Error interno del servidor al obtener Pokemones')
 
@@ -158,9 +167,15 @@ def read_pokemon(pokemon_id: int = Path(..., ge=1, description='ID del Pokémon'
         if db_pokemon is None:
             raise HTTPException(status_code=404, detail=f'Pokémon con ID {pokemon_id} no encontrado')
         return db_pokemon
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f'Error de base de datos: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail="Error interno al consultar la base de datos")
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
+        db.rollback()
         logger.error(f'Error obteniendo Pokémon {pokemon_id}: {e}', exc_info=True)
         raise HTTPException(status_code=500, detail=f'Error interno al obtener el Pokémon {pokemon_id}')
 
@@ -199,9 +214,15 @@ def read_pokemon_by_name(
                 detail = f"Pokémon '{pokemon_name}' no encontrado"
             raise HTTPException(status_code=404, detail=detail)
         return db_pokemon
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f'Error de base de datos: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail='Error interno al consultar la base de datos')
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
+        db.rollback()
         logger.error(f"Error obteniendo Pokémon '{pokemon_name}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error interno al buscar el Pokémon '{pokemon_name}'")
 
@@ -232,11 +253,42 @@ def get_pokemon_stats(pokemon_id: int, db: Session = Depends(get_db)):
                 'growth_rate': pokemon.growth_rate
             }
         }
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f'Error de base de datos: {e}', exc_info=True)
+        raise HTTPException(status_code=500, detail='Error interno al consultar la base de datos')
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
+        db.rollback()
         logger.error(f'Error obteniendo stats del Pokémon {pokemon_id}: {e}')
         raise HTTPException(status_code=500, detail='Error interno del servidor')
+
+
+@router.get('/search/suggestions')
+def get_pokemon_suggestions(q: str = Query(..., min_length=1), limit: int = 10, db: Session = Depends(get_db)):
+    pokemons = db.query(models.Pokemon.name).filter(models.Pokemon.name.ilike(f"{q}%")).limit(limit).all()
+    return [p[0] for p in pokemons]
+
+
+@router.get('/search/suggestions/detailed')
+def get_detailed_suggestions(
+    q: str = Query(..., min_length=1, description='Texto de búsqueda'),
+    limit: int = Query(10, ge=1, le=50, description='Número de sugerencias'),
+    db: Session = Depends(get_db)
+):
+    """
+    Devuelve sugerencias de Pokémon con información detallada:
+    id, nombre, tipos y URL del sprite oficial.
+    """
+    pokemons = db.query(models.Pokemon).filter(models.Pokemon.name.ilike(f'{q}%')).limit(limit).all()
+    result = []
+    for p in pokemons:
+        types = [t.name for t in p.types]
+        sprite_url = f'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/{p.id}.png'
+        result.append({'id': p.id, 'name': p.name, 'types': types, 'sprite': sprite_url})
+    return result
 
 
 @router.get('/validate/parameters')
@@ -325,10 +377,50 @@ def get_pokemons_by_type(type_name: str, db: Session = Depends(get_db)):
     return pokemons
 
 
-@router.get('/evolutions/have', response_model=List[schemas.Pokemon])
-def get_pokemons_with_evolutions(db: Session = Depends(get_db)):
-    pokemons = crud.get_pokemons_with_evolution(db)
-    return pokemons
+@router.get('/{pokemon_id}/evolutions', response_model=List[schemas.Evolution])
+def get_pokemon_evolutions(
+        pokemon_id: Optional[int],
+        name: Optional[str] = Query(None, min_length=1, max_length=50, description='Filtrar por nombre'),
+        db: Session = Depends(get_db)
+):
+    pokemon = crud.get_pokemon(db, pokemon_id) if str(pokemon_id).strip().isdigit() else crud.get_pokemon_by_name(db, name)
+    if not pokemon:
+        raise HTTPException(status_code=404, detail='Pokémon no encontrado')
+    evos = pokemon.evolutions
+    if isinstance(evos, str):
+        try:
+            evos = json.loads(evos)
+        except json.JSONDecodeError:
+            evos = []
+    if not isinstance(evos, list):
+        evos = []
+    return evos
+
+
+@router.get('/{pokemon_id}/evolution-chain', response_model=List[schemas.Evolution])
+def get_evolution_chain(
+        pokemon_id: Optional[int],
+        name: Optional[str] = Query(None, min_length=1, max_length=50, description='Filtrar por nombre'),
+        db: Session = Depends(get_db)
+):
+    pokemon = crud.get_pokemon(db, pokemon_id) if str(pokemon_id).strip().isdigit() else crud.get_pokemon_by_name(db, name)
+    if not pokemon:
+        raise HTTPException(status_code=404, detail='Pokémon no encontrado')
+    evos = pokemon.evolutions
+    if isinstance(evos, str):
+        try:
+            evos = json.loads(evos)
+        except json.JSONDecodeError:
+            evos = []
+    if not isinstance(evos, list):
+        evos = []
+    for ev in evos:
+        p = db.query(models.Pokemon).filter(models.Pokemon.name == ev['name']).first()
+        if p:
+            ev['id'] = p.id
+        else:
+            ev['id'] = None
+    return evos
 
 
 @router.get('/search/advanced', response_model=List[schemas.Pokemon])

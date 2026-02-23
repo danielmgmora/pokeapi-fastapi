@@ -1,9 +1,10 @@
+import aiohttp
 import asyncio
 import uuid
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from typing import Dict
+from typing import Dict, Optional
 from ..database import get_db, engine, Base
 from .. import schemas, crud, services, models
 
@@ -12,63 +13,93 @@ router = APIRouter(prefix='/admin', tags=['admin'])
 active_tasks: Dict[str, asyncio.Task] = {}
 
 
-@router.post("/load-pokemons-async", response_model=schemas.BaseResponse)
+@router.post('/load-pokemons-async', response_model=schemas.BaseResponse)
 async def load_pokemons_async(
-        params: schemas.PokemonBulkCreate,
-        force_update: bool = False,
-        db: Session = Depends(get_db)
+        limit: Optional[int] = None, offset: int = 0, batch_size: Optional[int] = 50,
+        force_update: bool = False, db: Session = Depends(get_db)
 ):
-    if params.limit > 5000:
-        raise HTTPException(status_code=400, detail='El límite máximo es 5000 por petición')
+    if limit is None:
+        try:
+            service = services.AsyncPokeAPIService()
+            async with aiohttp.ClientSession() as session:
+                url = f'{service.BASE_URL}/pokemon?limit=1'
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        total_pokemon = data.get('count', 0)
+                        if total_pokemon == 0:
+                            raise HTTPException(status_code=500, detail='No se pudo obtener el total de Pokémon desde PokeAPI')
+                        limit = total_pokemon
+                    else:
+                        raise HTTPException(status_code=500, detail=f'Error al conectar con la PokeAPI: {resp.status}')
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f'Error al obtener el total de Pokémon: {str(e)}')
+    if limit > 10000:
+        raise HTTPException(status_code=400, detail='El límite máximo permitido es 10 000')
     task_id = f'pokemon_load_{uuid.uuid4().hex[:8]}_{int(datetime.now().timestamp())}'
     task_data = {
-        'limit': params.limit,
-        'offset': params.offset,
-        'batch_size': params.batch_size or 50,
+        'limit': limit,
+        'offset': offset,
+        'batch_size': batch_size,
         'force_update': force_update
     }
     crud.create_task(db, task_id, 'pokemon_load', task_data)
-    async_task = asyncio.create_task(process_pokemon_load(task_id, params, force_update, db))
+    async_task = asyncio.create_task(
+        process_pokemon_load(task_id, limit, offset, batch_size, force_update, db)
+    )
     active_tasks[task_id] = async_task
     async_task.add_done_callback(lambda t: active_tasks.pop(task_id, None))
     return schemas.BaseResponse(
         success=True,
-        message=f'Carga de Pokémon iniciada en segundo plano',
-        data = {
+        message='Carga de Pokémon iniciada en segundo plano',
+        data={
             'task_id': task_id,
+            'total_pokemon': limit,
             'status_url': f'/admin/tasks/{task_id}',
             'cancel_url': f'/admin/tasks/{task_id}/cancel',
-            'estimated_time': f'{(params.limit / 10) * 2:.0f} segundos aproximados'
+            'estimated_time': f'{(limit / 10) * 2:.0f} segundos aproximados'
         }
     )
 
 
-async def process_pokemon_load(task_id: str, params: schemas.PokemonBulkCreate, force_update: bool, db: Session):
+async def process_pokemon_load(task_id: str, limit: int, offset: int, batch_size: int, force_update: bool, db: Session):
     try:
-        crud.update_task_progress(db, task_id, 0, 0, params.limit)
+        crud.update_task_progress(db, task_id, 0, 0, limit)
         loader = services.BulkPokemonLoader(db)
-        batch_size = params.batch_size or 50
-        total_batches = (params.limit + batch_size - 1) // batch_size
+        total_batches = (limit + batch_size - 1) // batch_size
         total_loaded = 0
         total_errors = 0
         for batch_num in range(total_batches):
-            batch_offset = params.offset + (batch_num * batch_size)
-            batch_limit = min(batch_size, params.limit - (batch_num * batch_size))
-            result = await loader.load_pokemons(limit=batch_limit, offset=batch_offset, force_update=force_update)
+            batch_offset = offset + (batch_num * batch_size)
+            batch_limit = min(batch_size, limit - (batch_num * batch_size))
+            result = await loader.load_pokemons(
+                limit=batch_limit,
+                offset=batch_offset,
+                force_update=force_update
+            )
             total_loaded += result.get('loaded', 0)
             total_errors += result.get('errors', 0)
             progress = int(((batch_num + 1) / total_batches) * 100)
             processed = (batch_num + 1) * batch_size
-            crud.update_task_progress(db, task_id, progress, min(processed, params.limit), params.limit)
+            crud.update_task_progress(
+                db, task_id, progress,
+                min(processed, limit), limit
+            )
             await asyncio.sleep(0.5)
         crud.complete_task(db, task_id, {
-            'total_requested': params.limit,
+            'total_requested': limit,
             'loaded': total_loaded,
             'errors': total_errors,
             'completed_at': datetime.utcnow().isoformat()
         })
     except Exception as e:
         crud.fail_task(db, task_id, str(e))
+
+
+@router.post('/run-daily-update', response_model=schemas.BaseResponse)
+async def trigger_daily_update():
+    asyncio.create_task(services.run_daily_pokemon_update())
+    return {'success': True, 'message': 'Actualización diaria de Pokemones iniciada'}
 
 
 @router.get('/tasks/{task_id}', response_model=schemas.BaseResponse)
